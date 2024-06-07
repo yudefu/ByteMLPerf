@@ -39,8 +39,9 @@ def gen_stream_request(
             "top_p": serialize_value(top_p),
             "top_k": serialize_value(top_k),
             "get_input_logits": serialize_value(get_input_logits),
-        },
+        }, 
     )
+
     for res in stub.StreamingInference(req, wait_for_ready=False):
         yield res
 
@@ -141,10 +142,11 @@ def benchmark(
     input_tokens: int,
     result_queue: mp.Queue,
     args,
+    port: str,
 ):
     logger.debug(f"{report_type.name} bench_{index} start")
 
-    with grpc.insecure_channel(f"{args.host}:{args.port}") as channel:
+    with grpc.insecure_channel(f"{args.host}:{port}") as channel:
         stub = server_pb2_grpc.InferenceStub(channel)
         time.sleep(random.randint(0, 10))
 

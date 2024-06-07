@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import sys
+import time
 import argparse
 import subprocess
 import json
@@ -22,7 +23,7 @@ from typing import Any, Dict, Iterable, List
 
 
 # ${prj_root}/
-BYTE_MLPERF_ROOT = os.path.byte_infer_perfdirname(os.path.dirname(os.path.abspath(__file__)))
+BYTE_MLPERF_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(BYTE_MLPERF_ROOT)
 sys.path.insert(0, BYTE_MLPERF_ROOT)
 
@@ -94,7 +95,7 @@ class PerfEngine:
         self.task = self.args.task
         self.result_queue = mp.Queue()
         self.jobs: List[mp.Process] = []
-        self.server_process = None
+        self.server_process = []
 
     def __del__(self):
         self.stop_server()
@@ -185,11 +186,13 @@ class PerfEngine:
         # 1. Start server
         self.start_server(tp_size, batch_size)
 
+        time.sleep(20)
+
         # 2. Benchmark clients
         self.start_benchmark(workload, batch_size, input_tokens, report_type)
 
         # 3. Get result
-        alive_clients = batch_size if report_type == ReportType.PERFORMANCE else 1
+        alive_clients = batch_size*2 if report_type == ReportType.PERFORMANCE else 1
         started: bool = False
         while alive_clients:
             result = self.result_queue.get()
@@ -211,29 +214,41 @@ class PerfEngine:
         # 5. Kill server process
         self.stop_server()
 
-
-
-
     def start_server(self, tp_size: int, batch_size: int):
         fifo_name = "./server_fifo"
         try:
             os.mkfifo(fifo_name)
         except FileExistsError:
             logger.debug(f"{fifo_name} already exist")
-        command = [
-            "torchrun",
-            "--master_port", "19999",
-            "--nproc-per-node", str(tp_size),
-            "llm_perf/server/launch_server.py",
-            "--task", self.task,
-            "--hardware_type", self.backend_type,
-            "--port", self.port,
-            "--max_batch_size", str(batch_size),
-        ]
-        logger.info(f"Start Server: {' '.join(command)}")
+        
 
-        # Use preexec_fn=os.setsid to make sure all subprocess in same process group (easy to kill process)
-        self.server_process = subprocess.Popen(command, preexec_fn=os.setsid)
+        # 第一个命令，在 GPU 0 上运行  
+        command0 = [  
+            "bash", "-c",  
+            f"export CUDA_VISIBLE_DEVICES=0; python3 llm_perf/server/launch_server.py "  
+            f"--task {self.task} "  
+            f"--hardware_type {self.backend_type} "  
+            f"--port {self.port} "  
+            f"--max_batch_size {batch_size}"  
+        ]  
+        
+        # 第二个命令，在 GPU 1 上运行  
+        command1 = [  
+            "bash", "-c",  
+            f"export CUDA_VISIBLE_DEVICES=1; python3 llm_perf/server/launch_server.py "  
+            f"--task {self.task} "  
+            f"--hardware_type {self.backend_type} "  
+            f"--port {int(self.port)+1} "  
+            f"--max_batch_size {batch_size}"  
+        ]  
+        
+        # 日志输出  
+        logger.info(f"Start Server on GPU 0: {' '.join(command0[2:])}") 
+        logger.info(f"Start Server on GPU 1: {' '.join(command1[2:])}")  
+        
+        # 启动进程  
+        self.server_process.append(subprocess.Popen(command0, preexec_fn=os.setsid))
+        self.server_process.append(subprocess.Popen(command1, preexec_fn=os.setsid))
 
         with open(fifo_name, "r") as fifo_fd:
             while True:
@@ -244,19 +259,19 @@ class PerfEngine:
         logger.info("Server Ready")
 
     def stop_server(self):
-        if self.server_process and self.server_process.poll() is None:
-            logger.info("stopping server process")
-            os.killpg(os.getpgid(self.server_process.pid), signal.SIGTERM)
-            try:
-                self.server_process.wait(timeout=5)
-                logger.info("server process has stopped")
-            except subprocess.TimeoutExpired:
-                os.killpg(os.getpgid(self.server_process.pid), signal.SIGKILL)
-                logger.info("server process force killing")
-        else:
-            # logger already exit
-            print(f"server process already exit with {self.server_process.poll()}")
-
+        for s in self.server_process:
+            if s and s.poll() is None:
+                logger.info("stopping server process")
+                os.killpg(os.getpgid(s.pid), signal.SIGTERM)
+                try:
+                    s.wait(timeout=5)
+                    logger.info("server process has stopped")
+                except subprocess.TimeoutExpired:
+                    os.killpg(os.getpgid(s.pid), signal.SIGKILL)
+                    logger.info("server process force killing")
+            else:
+                # logger already exit
+                print(f"server process already exit with {s.poll()}")
 
     # launch clients threads
     def start_benchmark(
@@ -277,6 +292,22 @@ class PerfEngine:
                     input_tokens,
                     self.result_queue,
                     self.args,
+                    self.port
+                ),
+            )
+            self.jobs.append(p)
+            p.start()
+        for i in range(clients):
+            p = mp.Process(
+                target=benchmark,
+                args=(
+                    i,
+                    workload,
+                    report_type,
+                    input_tokens,
+                    self.result_queue,
+                    self.args,
+                    str(int(self.port) + 1)
                 ),
             )
             self.jobs.append(p)
